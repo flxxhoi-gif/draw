@@ -256,7 +256,9 @@
         img.onload = () => { const k = 2, cv = document.createElement("canvas"); cv.width = rect.width * k; cv.height = rect.height * k; const ctx = cv.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height); ctx.drawImage(img, 0, 0, cv.width, cv.height); cv.toBlob((b) => download(name, b), "image/png"); };
         img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(s);
       };
+
       const exportPrint = () => {
+        // Helper to grab the SVG as a clean string
         const getSvgString = (ref) => {
           const node = ref.current.cloneNode(true);
           node.setAttribute("xmlns", "http://www.w3.org/2000/svg");
@@ -269,6 +271,7 @@
         const svg2d = getSvgString(svg2dRef);
         const svg3d = getSvgString(svg3dRef);
 
+        // Build the Legend HTML (restored the missing <div> and styling)
         const legendHtml = TYPES.map(t => `
           <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px;">
             <div style="width: 45px; height: ${t.w}px; background-color: ${t.color}; border-radius: 2px;"></div>
@@ -278,6 +281,7 @@
           </div>
         `).join('');
 
+        // Construct the full HTML page (restored ALL missing tags, headers, and CSS)
         const htmlContent = `
           <!DOCTYPE html>
           <html lang="en">
@@ -329,6 +333,7 @@
           </html>
         `;
 
+        // Open window and inject HTML
         const printWin = window.open('', '_blank');
         printWin.document.open();
         printWin.document.write(htmlContent);
