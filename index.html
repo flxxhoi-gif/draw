@@ -1,0 +1,435 @@
+import React, { useRef, useState } from "react";
+import {
+  Eraser, Pencil, Trash2, RotateCcw, LayoutGrid, Download,
+  Plus, Minus, Square, Box, ArrowUpDown, Slash, RotateCw, Move3d,
+} from "lucide-react";
+
+/* ============================================================== *
+ *  Steel-panel tank — angle-stay editor                           *
+ *  2D plan + orbitable 3D. 3D nodes carry a level (z), so a stay   *
+ *  can run within a plane OR slant top↔bottom across the wall.     *
+ *  Tools: Draw (cell diagonal), Line (node→node), Erase.          *
+ * ============================================================== */
+
+const PANEL_FT = 4;
+const TYPES = [
+  { id: "corner", label: "67½° corner stay", len: "corner lining", color: "#d9a022", w: 6 },
+  { id: "main",   label: "11′-3½″ main",      len: "main diagonal", color: "#2f9e54", w: 5 },
+  { id: "opp",    label: "11′-3½″ (opp)",      len: "secondary",     color: "#c9b78a", w: 5 },
+  { id: "tie",    label: "7′-8″ tie (opp)",    len: "short tie",     color: "#c0392b", w: 4.5 },
+];
+const TYPE_MAP = Object.fromEntries(TYPES.map((t) => [t.id, t]));
+const COL = {
+  paper: "#f4f2ec", panel: "#ffffff", ink: "#1c2733", blue: "#1f4e79",
+  grid: "#9aa6b0", muted: "#6b7682", line: "#d8d3c7", dim: "#aab4bd", hl: "#eef2f6",
+};
+const EYE = { letterSpacing: "0.14em" };
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+/* ---- 2D segment model: "c,r|c,r" ---- */
+const nk = (c, r) => `${c},${r}`;
+const segKey = (a, b) => { const k1 = nk(a[0], a[1]), k2 = nk(b[0], b[1]); return k1 < k2 ? `${k1}|${k2}` : `${k2}|${k1}`; };
+const parseSeg = (key) => key.split("|").map((s) => s.split(",").map(Number));
+const diagEnds = (c, r, dir) => dir === "b" ? [[c, r], [c + 1, r + 1]] : [[c, r + 1], [c + 1, r]];
+const makeCorners = (cols, rows) => ({
+  [segKey([0, 1], [1, 0])]: "corner",
+  [segKey([cols - 1, 0], [cols, 1])]: "corner",
+  [segKey([0, rows - 1], [1, rows])]: "corner",
+  [segKey([cols - 1, rows], [cols, rows - 1])]: "corner",
+});
+const REF_RAW = {
+  "0-0-f": "corner", "5-0-b": "corner", "0-2-b": "corner", "5-2-f": "corner",
+  "0-0-b": "main", "1-1-b": "main", "2-2-b": "main", "2-0-f": "main", "1-1-f": "main", "0-2-f": "main",
+  "3-0-b": "main", "4-1-b": "main", "5-2-b": "main", "5-0-f": "main", "4-1-f": "main", "3-2-f": "main",
+  "1-0-f": "opp", "4-0-b": "opp", "1-2-b": "opp", "4-2-f": "opp", "2-1-b": "tie", "3-1-f": "tie",
+};
+const REFERENCE = Object.fromEntries(Object.entries(REF_RAW).map(([k, t]) => {
+  const [c, r, d] = k.split("-"); const [a, b] = diagEnds(+c, +r, d); return [segKey(a, b), t];
+}));
+const prune = (map, cols, rows) => Object.fromEntries(Object.entries(map).filter(([k]) => {
+  const [[c0, r0], [c1, r1]] = parseSeg(k); return c0 <= cols && c1 <= cols && r0 <= rows && r1 <= rows;
+}));
+
+/* ---- 3D segment model: "c,r,z|c,r,z" (z = wall level) ---- */
+const nk3 = (c, r, z) => `${c},${r},${z}`;
+const segKey3 = (a, b) => { const k1 = nk3(a[0], a[1], a[2]), k2 = nk3(b[0], b[1], b[2]); return k1 < k2 ? `${k1}|${k2}` : `${k2}|${k1}`; };
+const parseSeg3 = (key) => key.split("|").map((s) => s.split(",").map(Number));
+const makeCorners3 = (cols, rows, z) => Object.fromEntries(
+  [[[0, 1], [1, 0]], [[cols - 1, 0], [cols, 1]], [[0, rows - 1], [1, rows]], [[cols - 1, rows], [cols, rows - 1]]]
+    .map(([p, q]) => [segKey3([p[0], p[1], z], [q[0], q[1], z]), "corner"]));
+const prune3 = (map, cols, rows) => Object.fromEntries(Object.entries(map).filter(([k]) => {
+  const [a, b] = parseSeg3(k); return a[0] <= cols && b[0] <= cols && a[1] <= rows && b[1] <= rows;
+}));
+
+const distSeg = (p, a, b) => {
+  const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy || 1;
+  let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2; t = clamp(t, 0, 1);
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+};
+const download = (name, blob) => {
+  const url = URL.createObjectURL(blob); const a = document.createElement("a");
+  a.href = url; a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+const userPoint = (svg, e) => {
+  const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY;
+  return pt.matrixTransform(svg.getScreenCTM().inverse());
+};
+
+/* ---------------- 3D projection (orbit) ---------------- */
+const SCALE3 = 30;
+const project3 = (c, r, z, az, pitch, cx, cy) => {
+  const A = az * Math.PI / 180, T = pitch * Math.PI / 180, X = c - cx, Y = r - cy;
+  const ax = X * Math.cos(A) - Y * Math.sin(A), ay = X * Math.sin(A) + Y * Math.cos(A);
+  return { x: ax * SCALE3, y: (ay * Math.cos(T) - z * Math.sin(T)) * SCALE3 };
+};
+const invert3 = (sx, sy, z, az, pitch, cx, cy) => {
+  const A = az * Math.PI / 180, T = pitch * Math.PI / 180;
+  const ax = sx / SCALE3, ay = (sy / SCALE3 + z * Math.sin(T)) / Math.cos(T);
+  return { x: ax * Math.cos(A) + ay * Math.sin(A) + cx, y: -ax * Math.sin(A) + ay * Math.cos(A) + cy };
+};
+
+export default function StayLayoutEditor() {
+  const [cols, setCols] = useState(6);
+  const [rows, setRows] = useState(3);
+  const [height, setHeight] = useState(1);
+  const [partition, setPartition] = useState(true);
+  const [pcol, setPcol] = useState(3);
+
+  const [active, setActive] = useState("corner");
+  const [tool, setToolRaw] = useState("draw");
+  const [plane, setPlaneRaw] = useState("bottom");
+
+  const [stays2d, setStays2d] = useState(REFERENCE);
+  const [stays3d, setStays3d] = useState(() => makeCorners3(6, 3, 0));
+
+  const [hover2, setHover2] = useState(null);
+  const [hover3, setHover3] = useState(null);
+  const [start2, setStart2] = useState(null);     // [c,r]
+  const [start3, setStart3] = useState(null);     // [c,r,z]
+
+  const [az, setAz] = useState(35);
+  const [pitch, setPitch] = useState(58);
+
+  const svg2dRef = useRef(null);
+  const svg3dRef = useRef(null);
+  const drag = useRef({ down: false, moved: false, lx: 0, ly: 0 });
+
+  const cx = cols / 2, cy = rows / 2;
+  const activeZ = plane === "top" ? height : 0;
+  const lenFt = cols * PANEL_FT, widFt = rows * PANEL_FT, htFt = height * PANEL_FT;
+
+  const setTool = (t) => { setToolRaw(t); setStart2(null); setStart3(null); };
+  const setPlane = (p) => setPlaneRaw(p);     // NOTE: does not clear line start → enables top↔bottom lines
+
+  const resize = (nc, nr) => {
+    nc = clamp(nc, 2, 12); nr = clamp(nr, 1, 8);
+    setCols(nc); setRows(nr); setPcol((p) => clamp(p, 1, nc - 1));
+    setStays2d((m) => prune(m, nc, nr));
+    setStays3d((m) => prune3(m, nc, nr));
+    setStart3(null); setStart2(null);
+  };
+
+  /* ---------- 2D ---------- */
+  const world2 = (e) => { const p = userPoint(svg2dRef.current, e); return { u: (p.x - OX) / CELL, v: (p.y - OY) / CELL, px: p.x, py: p.y }; };
+  const click2 = (e) => {
+    const w = world2(e);
+    if (tool === "erase") {
+      let best = null, bd = 11;
+      for (const key of Object.keys(stays2d)) { const [a, b] = parseSeg(key); const d = distSeg({ x: w.px, y: w.py }, P2(a[0], a[1]), P2(b[0], b[1])); if (d < bd) { bd = d; best = key; } }
+      if (best) setStays2d((m) => { const n = { ...m }; delete n[best]; return n; });
+      return;
+    }
+    if (tool === "line") {
+      const node = [clamp(Math.round(w.u), 0, cols), clamp(Math.round(w.v), 0, rows)];
+      if (!start2) { setStart2(node); return; }
+      if (node[0] !== start2[0] || node[1] !== start2[1]) setStays2d((m) => ({ ...m, [segKey(start2, node)]: active }));
+      setStart2(null); return;
+    }
+    if (w.u < 0 || w.u > cols || w.v < 0 || w.v > rows) return;
+    const c = clamp(Math.floor(w.u), 0, cols - 1), r = clamp(Math.floor(w.v), 0, rows - 1);
+    const lx = w.u - c, ly = w.v - r, dir = Math.abs(lx - ly) <= Math.abs(lx + ly - 1) ? "b" : "f";
+    const [a, b] = diagEnds(c, r, dir); const key = segKey(a, b);
+    setStays2d((m) => { const n = { ...m }; if (n[key] === active) delete n[key]; else n[key] = active; return n; });
+  };
+
+  /* ---------- 3D ---------- */
+  const world3 = (e) => { const p = userPoint(svg3dRef.current, e); return invert3(p.x, p.y, activeZ, az, pitch, cx, cy); };
+  const click3 = (e) => {
+    const w = world3(e);
+    if (tool === "erase") {
+      const p = userPoint(svg3dRef.current, e); let best = null, bd = 11;
+      for (const key of Object.keys(stays3d)) {
+        const [a, b] = parseSeg3(key);
+        const pa = project3(a[0], a[1], a[2], az, pitch, cx, cy), pb = project3(b[0], b[1], b[2], az, pitch, cx, cy);
+        const d = distSeg({ x: p.x, y: p.y }, pa, pb); if (d < bd) { bd = d; best = key; }
+      }
+      if (best) setStays3d((m) => { const n = { ...m }; delete n[best]; return n; });
+      return;
+    }
+    if (tool === "line") {
+      const node = [clamp(Math.round(w.x), 0, cols), clamp(Math.round(w.y), 0, rows), activeZ];
+      if (!start3) { setStart3(node); return; }
+      if (node[0] !== start3[0] || node[1] !== start3[1] || node[2] !== start3[2])
+        setStays3d((m) => ({ ...m, [segKey3(start3, node)]: active }));
+      setStart3(null); return;
+    }
+    if (w.x < 0 || w.x > cols || w.y < 0 || w.y > rows) return;
+    const c = clamp(Math.floor(w.x), 0, cols - 1), r = clamp(Math.floor(w.y), 0, rows - 1);
+    const lx = w.x - c, ly = w.y - r, dir = Math.abs(lx - ly) <= Math.abs(lx + ly - 1) ? "b" : "f";
+    const [e0, e1] = diagEnds(c, r, dir); const key = segKey3([...e0, activeZ], [...e1, activeZ]);
+    setStays3d((m) => { const n = { ...m }; if (n[key] === active) delete n[key]; else n[key] = active; return n; });
+  };
+  const onDown3 = (e) => { try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) { } drag.current = { down: true, moved: false, lx: e.clientX, ly: e.clientY }; };
+  const onMove3 = (e) => {
+    const d = drag.current;
+    if (d.down) {
+      const dx = e.clientX - d.lx, dy = e.clientY - d.ly;
+      if (Math.abs(dx) + Math.abs(dy) > 3) d.moved = true;
+      if (d.moved) { setAz((a) => (a + dx * 0.6 + 360) % 360); setPitch((p) => clamp(p - dy * 0.5, 10, 87)); d.lx = e.clientX; d.ly = e.clientY; setHover3(null); }
+    } else setHover3(world3(e));
+  };
+  const onUp3 = (e) => { const d = drag.current; if (d.down && !d.moved) click3(e); drag.current.down = false; };
+
+  const clearPlane = () => setStays3d((m) => Object.fromEntries(Object.entries(m).filter(([k]) => { const [a, b] = parseSeg3(k); return !(a[2] === activeZ && b[2] === activeZ); })));
+  const addCorners3 = () => setStays3d((m) => ({ ...m, ...makeCorners3(cols, rows, activeZ) }));
+
+  /* ---------- exports ---------- */
+  const exportJSON = () => download("tank-stays.json", new Blob([JSON.stringify({ tank: { cols, rows, height, partition, pcol }, stays2d, stays3d }, null, 2)], { type: "application/json" }));
+  const exportSVG = (ref, name) => { const n = ref.current.cloneNode(true); n.setAttribute("xmlns", "http://www.w3.org/2000/svg"); download(name, new Blob([new XMLSerializer().serializeToString(n)], { type: "image/svg+xml" })); };
+  const exportPNG = (ref, name) => {
+    const node = ref.current.cloneNode(true); node.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    const rect = ref.current.getBoundingClientRect(); const s = new XMLSerializer().serializeToString(node); const img = new Image();
+    img.onload = () => { const k = 2, cv = document.createElement("canvas"); cv.width = rect.width * k; cv.height = rect.height * k; const ctx = cv.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, cv.width, cv.height); ctx.drawImage(img, 0, 0, cv.width, cv.height); cv.toBlob((b) => download(name, b), "image/png"); };
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(s);
+  };
+
+  return (
+    <div style={{ background: COL.paper, color: COL.ink }} className="w-full min-h-screen p-4 sm:p-6">
+      <div className="max-w-6xl mx-auto">
+        <div className="flex items-end justify-between border-b-2 pb-3 mb-4" style={{ borderColor: COL.ink }}>
+          <div>
+            <h1 className="text-xl sm:text-2xl font-bold tracking-tight leading-none">STEEL PANEL TANK</h1>
+            <p className="text-xs mt-1" style={{ color: COL.muted, letterSpacing: "0.18em" }}>ANGLE-STAY LAYOUT EDITOR</p>
+          </div>
+          <div className="text-right">
+            <div className="font-bold" style={{ color: COL.blue }}>{lenFt}′ × {widFt}′ × {htFt}′ (H)</div>
+            <div className="text-xs" style={{ color: COL.muted }}>{PANEL_FT}′×{PANEL_FT}′ panels · {cols} × {rows} grid</div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mb-4 px-3 py-2 rounded border" style={{ borderColor: COL.line, background: COL.panel }}>
+          <Stepper icon={<Square size={13} />} label="Length" value={cols} suffix={`= ${lenFt}′`} onDec={() => resize(cols - 1, rows)} onInc={() => resize(cols + 1, rows)} />
+          <Stepper label="Width" value={rows} suffix={`= ${widFt}′`} onDec={() => resize(cols, rows - 1)} onInc={() => resize(cols, rows + 1)} />
+          <Stepper icon={<ArrowUpDown size={13} />} label="Height" value={height} suffix={`= ${htFt}′`} onDec={() => setHeight((h) => Math.max(1, h - 1))} onInc={() => setHeight((h) => Math.min(4, h + 1))} />
+          <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
+            <input type="checkbox" checked={partition} onChange={(e) => setPartition(e.target.checked)} className="h-4 w-4" style={{ accentColor: COL.blue }} /> Partition
+          </label>
+          {partition && <Stepper label="at col" value={pcol} onDec={() => setPcol((p) => Math.max(1, p - 1))} onInc={() => setPcol((p) => Math.min(cols - 1, p + 1))} />}
+        </div>
+
+        <div className="flex flex-col lg:flex-row gap-5">
+          <aside className="w-full lg:w-56 shrink-0 space-y-4">
+            <div className="flex gap-2">
+              <ToolBtn on={tool === "draw"} onClick={() => setTool("draw")}><Pencil size={14} /> Draw</ToolBtn>
+              <ToolBtn on={tool === "line"} onClick={() => setTool("line")}><Slash size={14} /> Line</ToolBtn>
+              <ToolBtn on={tool === "erase"} onClick={() => setTool("erase")}><Eraser size={14} /> Erase</ToolBtn>
+            </div>
+
+            <div className="rounded border" style={{ borderColor: COL.line, background: COL.panel }}>
+              <div className="px-3 py-2 text-xs border-b" style={{ borderColor: COL.line, color: COL.muted, ...EYE }}>STAY TYPE</div>
+              <div className="p-2 space-y-1">
+                {TYPES.map((t) => {
+                  const on = active === t.id && tool !== "erase";
+                  return (
+                    <button key={t.id} onClick={() => { setActive(t.id); if (tool === "erase") setTool("draw"); }}
+                      className="w-full flex items-center gap-2.5 px-2 py-1.5 rounded text-left"
+                      style={{ background: on ? COL.hl : "transparent", outline: on ? `2px solid ${t.color}` : "none" }}>
+                      <span style={{ background: t.color }} className="h-1.5 w-7 rounded-full shrink-0" />
+                      <span className="flex-1 min-w-0">
+                        <span className="block text-sm font-medium leading-tight truncate">{t.label}</span>
+                        <span className="block text-xs leading-tight" style={{ color: COL.muted }}>{t.len}</span>
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="rounded border" style={{ borderColor: COL.line, background: COL.panel }}>
+              <div className="px-3 py-2 text-xs border-b" style={{ borderColor: COL.line, color: COL.muted, ...EYE }}>EXPORT</div>
+              <div className="p-2 space-y-1.5">
+                <ExBtn onClick={exportJSON}><Download size={13} /> Layout JSON</ExBtn>
+                <div className="flex gap-1.5"><ExBtn small onClick={() => exportSVG(svg2dRef, "tank-2d.svg")}>2D SVG</ExBtn><ExBtn small onClick={() => exportPNG(svg2dRef, "tank-2d.png")}>2D PNG</ExBtn></div>
+                <div className="flex gap-1.5"><ExBtn small onClick={() => exportSVG(svg3dRef, "tank-3d.svg")}>3D SVG</ExBtn><ExBtn small onClick={() => exportPNG(svg3dRef, "tank-3d.png")}>3D PNG</ExBtn></div>
+              </div>
+            </div>
+
+            <p className="text-xs leading-snug px-1" style={{ color: COL.muted }}>
+              {tool === "line"
+                ? "Line spans any nodes. In 3D: click a start, switch Top/Bottom, click the end → a slanted top↔bottom stay."
+                : "Draw: click a panel for the nearest diagonal. Erase: click a stay. Drag the 3D view to orbit."}
+            </p>
+          </aside>
+
+          <main className="flex-1 space-y-5">
+            <section className="rounded border" style={{ borderColor: COL.line, background: COL.panel }}>
+              <div className="flex items-center justify-between gap-2 px-3 py-2 border-b flex-wrap" style={{ borderColor: COL.line }}>
+                <span className="flex items-center gap-1.5 text-xs" style={{ color: COL.muted, ...EYE }}><Square size={13} /> TOP VIEW (PLAN)</span>
+                <div className="flex items-center gap-1.5">
+                  <MiniBtn onClick={() => setStays2d(makeCorners(cols, rows))}><LayoutGrid size={12} /> Corners</MiniBtn>
+                  <MiniBtn onClick={() => { resize(6, 3); setStays2d(REFERENCE); }}><RotateCcw size={12} /> Example</MiniBtn>
+                  <MiniBtn onClick={() => setStays2d({})}><Trash2 size={12} /> Clear</MiniBtn>
+                </div>
+              </div>
+              <TopView svgRef={svg2dRef} cols={cols} rows={rows} pcol={pcol} partition={partition}
+                stays={stays2d} hover={hover2} start={start2} tool={tool} active={active}
+                onMove={(e) => setHover2(world2(e))} onLeave={() => setHover2(null)} onClick={click2} />
+            </section>
+
+            <section className="rounded border" style={{ borderColor: COL.line, background: COL.panel }}>
+              <div className="flex items-center justify-between gap-2 px-3 py-2 border-b flex-wrap" style={{ borderColor: COL.line }}>
+                <span className="flex items-center gap-1.5 text-xs" style={{ color: COL.muted, ...EYE }}><Box size={13} /> 3D — PICKING {plane.toUpperCase()} ({plane === "top" ? `z=${height}` : "z=0"})</span>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <div className="flex rounded overflow-hidden border" style={{ borderColor: COL.line }}>
+                    <PlaneBtn on={plane === "top"} onClick={() => setPlane("top")}>Top</PlaneBtn>
+                    <PlaneBtn on={plane === "bottom"} onClick={() => setPlane("bottom")}>Bottom</PlaneBtn>
+                  </div>
+                  <MiniBtn onClick={() => setAz((a) => (a - 30 + 360) % 360)}><RotateCcw size={12} /></MiniBtn>
+                  <MiniBtn onClick={() => setAz((a) => (a + 30) % 360)}><RotateCw size={12} /></MiniBtn>
+                  <MiniBtn onClick={() => { setAz(35); setPitch(58); }}><Move3d size={12} /> Reset</MiniBtn>
+                  <MiniBtn onClick={addCorners3}><LayoutGrid size={12} /> Corners</MiniBtn>
+                  <MiniBtn onClick={clearPlane}><Trash2 size={12} /> Clear</MiniBtn>
+                </div>
+              </div>
+              <IsoView svgRef={svg3dRef} cols={cols} rows={rows} H={height} plane={plane} activeZ={activeZ} az={az} pitch={pitch}
+                partition={partition} pcol={pcol} stays={stays3d} hover={hover3} start={start3} tool={tool} active={active}
+                onPointerDown={onDown3} onPointerMove={onMove3} onPointerUp={onUp3}
+                onPointerLeave={() => { setHover3(null); drag.current.down = false; }} />
+            </section>
+          </main>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- atoms ---------------- */
+function ToolBtn({ on, onClick, children }) {
+  return <button onClick={onClick} className="flex-1 flex items-center justify-center gap-1 py-2 rounded text-sm font-medium border"
+    style={on ? { background: COL.ink, color: COL.paper, borderColor: COL.ink } : { background: COL.panel, color: COL.ink, borderColor: COL.line }}>{children}</button>;
+}
+function MiniBtn({ onClick, children }) {
+  return <button onClick={onClick} className="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium border" style={{ borderColor: COL.line, background: COL.panel, color: COL.ink }}>{children}</button>;
+}
+function PlaneBtn({ on, onClick, children }) {
+  return <button onClick={onClick} className="px-2.5 py-1 text-xs font-medium" style={on ? { background: COL.blue, color: "#fff" } : { background: COL.panel, color: COL.ink }}>{children}</button>;
+}
+function ExBtn({ onClick, children, small }) {
+  return <button onClick={onClick} className={"flex items-center justify-center gap-1.5 rounded border font-medium " + (small ? "flex-1 py-1.5 text-xs" : "w-full py-1.5 text-sm")} style={{ borderColor: COL.line, background: COL.panel, color: COL.ink }}>{children}</button>;
+}
+function Stepper({ icon, label, value, suffix, onDec, onInc }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="flex items-center gap-1 text-xs font-medium" style={{ color: COL.muted }}>{icon}{label}</span>
+      <div className="flex items-center rounded border overflow-hidden" style={{ borderColor: COL.line }}>
+        <button onClick={onDec} className="px-1.5 py-1"><Minus size={12} /></button>
+        <span className="px-2 text-sm font-mono tabular-nums text-center" style={{ minWidth: "1.4rem" }}>{value}</span>
+        <button onClick={onInc} className="px-1.5 py-1"><Plus size={12} /></button>
+      </div>
+      {suffix && <span className="text-xs font-mono" style={{ color: COL.muted }}>{suffix}</span>}
+    </div>
+  );
+}
+
+/* ---------------- 2D plan ---------------- */
+const CELL = 60, OX = 56, OY = 46;
+const P2 = (c, r) => ({ x: OX + c * CELL, y: OY + r * CELL });
+function TopView({ svgRef, cols, rows, pcol, partition, stays, hover, start, tool, active, onMove, onLeave, onClick }) {
+  const gw = cols * CELL, gh = rows * CELL, tcolor = TYPE_MAP[active].color;
+  let ghost = null, startDot = null, hoverNode = null;
+  if (hover) {
+    if (tool === "draw" && hover.u >= 0 && hover.u <= cols && hover.v >= 0 && hover.v <= rows) {
+      const c = clamp(Math.floor(hover.u), 0, cols - 1), r = clamp(Math.floor(hover.v), 0, rows - 1);
+      const lx = hover.u - c, ly = hover.v - r, dir = Math.abs(lx - ly) <= Math.abs(lx + ly - 1) ? "b" : "f";
+      const [a, b] = diagEnds(c, r, dir); if (!stays[segKey(a, b)]) ghost = [P2(a[0], a[1]), P2(b[0], b[1])];
+    } else if (tool === "line") hoverNode = [clamp(Math.round(hover.u), 0, cols), clamp(Math.round(hover.v), 0, rows)];
+  }
+  if (start) { startDot = P2(start[0], start[1]); if (tool === "line" && hoverNode) ghost = [startDot, P2(hoverNode[0], hoverNode[1])]; }
+  return (
+    <svg ref={svgRef} viewBox={`0 0 ${OX + gw + 96} ${OY + gh + 44}`} className="w-full h-auto block"
+      style={{ touchAction: "none", cursor: tool === "erase" ? "crosshair" : "copy" }} onMouseMove={onMove} onMouseLeave={onLeave} onClick={onClick}>
+      <defs><pattern id="hatch2" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke={COL.blue} strokeWidth="1.1" /></pattern></defs>
+      <rect x={OX} y={OY} width={gw} height={gh} fill="#fff" />
+      {Array.from({ length: cols - 1 }, (_, i) => <line key={"v" + i} x1={OX + (i + 1) * CELL} y1={OY} x2={OX + (i + 1) * CELL} y2={OY + gh} stroke={COL.grid} strokeWidth="1" />)}
+      {Array.from({ length: rows - 1 }, (_, j) => <line key={"h" + j} x1={OX} y1={OY + (j + 1) * CELL} x2={OX + gw} y2={OY + (j + 1) * CELL} stroke={COL.grid} strokeWidth="1" />)}
+      {partition && <rect x={OX + pcol * CELL - 4} y={OY} width="8" height={gh} fill="url(#hatch2)" stroke={COL.blue} strokeWidth="1.6" />}
+      <rect x={OX} y={OY} width={gw} height={gh} fill="none" stroke={COL.ink} strokeWidth="2.6" />
+      {Object.entries(stays).map(([key, tid]) => { const [a, b] = parseSeg(key); const pa = P2(a[0], a[1]), pb = P2(b[0], b[1]); const t = TYPE_MAP[tid]; return <line key={key} x1={pa.x} y1={pa.y} x2={pb.x} y2={pb.y} stroke={t.color} strokeWidth={t.w} strokeLinecap="round" />; })}
+      {ghost && <line x1={ghost[0].x} y1={ghost[0].y} x2={ghost[1].x} y2={ghost[1].y} stroke={tcolor} strokeWidth={TYPE_MAP[active].w} strokeLinecap="round" opacity="0.45" strokeDasharray="4 5" />}
+      {Array.from({ length: cols + 1 }).flatMap((_, i) => Array.from({ length: rows + 1 }).map((_, j) => <circle key={`n${i}-${j}`} cx={OX + i * CELL} cy={OY + j * CELL} r="2.1" fill={COL.ink} />))}
+      {hoverNode && <circle cx={P2(hoverNode[0], hoverNode[1]).x} cy={P2(hoverNode[0], hoverNode[1]).y} r="4.5" fill="none" stroke={tcolor} strokeWidth="1.6" />}
+      {startDot && <circle cx={startDot.x} cy={startDot.y} r="5" fill={COL.blue} />}
+      <text x={OX + gw / 2} y={OY - 14} textAnchor="middle" fontSize="13" fontWeight="600" fill={COL.muted} fontFamily="ui-monospace, monospace">{cols * PANEL_FT}′-0″</text>
+      <text x={OX - 16} y={OY + gh / 2} textAnchor="middle" fontSize="13" fontWeight="600" fill={COL.muted} fontFamily="ui-monospace, monospace" transform={`rotate(-90 ${OX - 16} ${OY + gh / 2})`}>{rows * PANEL_FT}′-0″</text>
+    </svg>
+  );
+}
+
+/* ---------------- 3D orbit view ---------------- */
+function IsoView({ svgRef, cols, rows, H, plane, activeZ, az, pitch, partition, pcol, stays, hover, start, tool, active, onPointerDown, onPointerMove, onPointerUp, onPointerLeave }) {
+  const cx = cols / 2, cy = rows / 2;
+  const PR = (c, r, z) => project3(c, r, z, az, pitch, cx, cy);
+  const poly = (pts) => pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  const tcolor = TYPE_MAP[active].color;
+
+  const corners = [];
+  for (const z of [0, H]) for (const [x, y] of [[0, 0], [cols, 0], [cols, rows], [0, rows]]) corners.push(PR(x, y, z));
+  const xs = corners.map((p) => p.x), ys = corners.map((p) => p.y), pad = 18;
+  const minx = Math.min(...xs) - pad, miny = Math.min(...ys) - pad, vbW = Math.max(...xs) - minx + pad, vbH = Math.max(...ys) - miny + pad;
+
+  const floor = [PR(0, 0, 0), PR(cols, 0, 0), PR(cols, rows, 0), PR(0, rows, 0)];
+  const rim = [PR(0, 0, H), PR(cols, 0, H), PR(cols, rows, H), PR(0, rows, H)];
+
+  let ghost = null, hoverNode = null, startDot = null;
+  if (hover) {
+    if (tool === "draw" && hover.x >= 0 && hover.x <= cols && hover.y >= 0 && hover.y <= rows) {
+      const c = clamp(Math.floor(hover.x), 0, cols - 1), r = clamp(Math.floor(hover.y), 0, rows - 1);
+      const lx = hover.x - c, ly = hover.y - r, dir = Math.abs(lx - ly) <= Math.abs(lx + ly - 1) ? "b" : "f";
+      const [e0, e1] = diagEnds(c, r, dir); if (!stays[segKey3([...e0, activeZ], [...e1, activeZ])]) ghost = [PR(e0[0], e0[1], activeZ), PR(e1[0], e1[1], activeZ)];
+    } else if (tool === "line") hoverNode = [clamp(Math.round(hover.x), 0, cols), clamp(Math.round(hover.y), 0, rows)];
+  }
+  if (start) { startDot = PR(start[0], start[1], start[2]); if (tool === "line" && hoverNode) ghost = [startDot, PR(hoverNode[0], hoverNode[1], activeZ)]; }
+
+  return (
+    <svg ref={svgRef} viewBox={`${minx.toFixed(1)} ${miny.toFixed(1)} ${vbW.toFixed(1)} ${vbH.toFixed(1)}`} className="w-full h-auto block"
+      style={{ touchAction: "none", maxHeight: "540px", cursor: tool === "erase" ? "crosshair" : "grab" }}
+      onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerLeave={onPointerLeave}>
+
+      <polygon points={poly(floor)} fill="#fff" />
+      {Array.from({ length: cols + 1 }).map((_, i) => { const a = PR(i, 0, 0), b = PR(i, rows, 0); return <line key={"fi" + i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={COL.grid} strokeWidth={i === 0 || i === cols ? 1.6 : 0.7} opacity={plane === "bottom" ? 1 : 0.55} />; })}
+      {Array.from({ length: rows + 1 }).map((_, j) => { const a = PR(0, j, 0), b = PR(cols, j, 0); return <line key={"fj" + j} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={COL.grid} strokeWidth={j === 0 || j === rows ? 1.6 : 0.7} opacity={plane === "bottom" ? 1 : 0.55} />; })}
+
+      {[[0, 0], [cols, 0], [cols, rows], [0, rows]].map(([c, r], i) => { const a = PR(c, r, 0), b = PR(c, r, H); return <line key={"post" + i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={COL.ink} strokeWidth="2" />; })}
+      {Array.from({ length: cols - 1 }).map((_, i) => { const a = PR(i + 1, 0, 0), b = PR(i + 1, 0, H); return <line key={"wf" + i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={COL.grid} strokeWidth="0.7" />; })}
+      {Array.from({ length: rows - 1 }).map((_, j) => { const a = PR(cols, j + 1, 0), b = PR(cols, j + 1, H); return <line key={"wr" + j} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={COL.grid} strokeWidth="0.7" />; })}
+      {Array.from({ length: H - 1 }).map((_, k) => { const a = PR(0, rows, k + 1), b = PR(cols, rows, k + 1), c = PR(cols, 0, k + 1); return <g key={"lvl" + k}><line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={COL.grid} strokeWidth="0.7" /><line x1={b.x} y1={b.y} x2={c.x} y2={c.y} stroke={COL.grid} strokeWidth="0.7" /></g>; })}
+
+      {partition && <polygon points={poly([PR(pcol, 0, 0), PR(pcol, rows, 0), PR(pcol, rows, H), PR(pcol, 0, H)])} fill={COL.blue} fillOpacity="0.1" stroke={COL.blue} strokeWidth="1.6" />}
+
+      {Array.from({ length: cols + 1 }).map((_, i) => { const a = PR(i, 0, H), b = PR(i, rows, H); return <line key={"ti" + i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={COL.grid} strokeWidth={i === 0 || i === cols ? 1.4 : 0.6} opacity={plane === "top" ? 1 : 0.5} />; })}
+      {Array.from({ length: rows + 1 }).map((_, j) => { const a = PR(0, j, H), b = PR(cols, j, H); return <line key={"tj" + j} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={COL.grid} strokeWidth={j === 0 || j === rows ? 1.4 : 0.6} opacity={plane === "top" ? 1 : 0.5} />; })}
+      <polygon points={poly(rim)} fill="none" stroke={COL.ink} strokeWidth="2" />
+
+      {/* stays (any z, including slanted top↔bottom) */}
+      {Object.entries(stays).map(([key, tid]) => {
+        const [a, b] = parseSeg3(key); const pa = PR(a[0], a[1], a[2]), pb = PR(b[0], b[1], b[2]); const t = TYPE_MAP[tid];
+        const sameZ = a[2] === b[2], faded = sameZ && a[2] !== activeZ;
+        return <line key={key} x1={pa.x} y1={pa.y} x2={pb.x} y2={pb.y} stroke={t.color} strokeWidth={Math.max(2.2, t.w * 0.62)} strokeLinecap="round" opacity={faded ? 0.4 : 1} />;
+      })}
+
+      {ghost && <line x1={ghost[0].x} y1={ghost[0].y} x2={ghost[1].x} y2={ghost[1].y} stroke={tcolor} strokeWidth={Math.max(2.2, TYPE_MAP[active].w * 0.62)} strokeLinecap="round" opacity="0.5" strokeDasharray="4 5" />}
+      {hoverNode && (() => { const p = PR(hoverNode[0], hoverNode[1], activeZ); return <circle cx={p.x} cy={p.y} r="4.5" fill="none" stroke={tcolor} strokeWidth="1.6" />; })()}
+      {startDot && <g><circle cx={startDot.x} cy={startDot.y} r="5" fill={COL.blue} /><circle cx={startDot.x} cy={startDot.y} r="9" fill="none" stroke={COL.blue} strokeWidth="1" opacity="0.5" /></g>}
+    </svg>
+  );
+}
